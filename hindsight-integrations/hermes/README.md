@@ -221,8 +221,8 @@ Some keys also accept an older name: `apiKey` for `api_key`, `budget` for `recal
 | Key | Default | Description |
 |-----|---------|-------------|
 | `bank_id` | `hermes` | Memory bank name (static fallback used when `bank_id_template` is unset or resolves empty) |
-| `bank_id_template` | — | Optional template to derive the bank name dynamically. Placeholders: `{profile}`, `{workspace}`, `{project}`, `{platform}`, `{user}`, `{session}`. `{project}` is the name of the git repository Hermes runs in; every worktree of a repository resolves to the same name, and it is empty outside a repository or for one rooted at your home directory. Example: `hermes-{profile}` isolates memory per active Hermes profile, `{project}` gives each repository its own bank. Empty placeholders collapse cleanly (e.g. `hermes-{user}` with no user becomes `hermes`). |
-| `bank_routes` | `[]` | Optional JSON list of chat/topic routes, matched by `platform`, `chat_id` and optional `thread_id`. Each route selects `bank_id` and can override `recall_additional_banks`. See "Conversation routes" below. |
+| `bank_id_template` | — | Optional template to derive the bank name dynamically. Placeholders: `{profile}`, `{workspace}`, `{project}`, `{platform}`, `{user}`, `{session}`, `{chat}`, `{thread}`. `{project}` is the name of the git repository Hermes runs in; every worktree of a repository resolves to the same name, and it is empty outside a repository or for one rooted at your home directory. Example: `hermes-{profile}` isolates memory per active Hermes profile, `{project}` gives each repository its own bank. Empty placeholders collapse cleanly, so `hermes-{user}` with no user becomes `hermes`. |
+| `channel_routes` | `[]` | Optional JSON list of conversation routes, matched by `platform`, `chat_id` and optional `thread_id`. Each route supplies exactly one nonempty `bank_id` or `bank_id_template` and can override `recall_additional_banks`. See "Channel routes" below. |
 | `mirror_to_own_bank` | `false` | Also write to `bank_id` when the template resolves to a different bank, so a profile keeps its own memory while working in project banks. |
 | `additional_banks` | — | Extra banks to write to and recall from, in priority order. |
 | `recall_additional_banks` | — | Extra banks to recall from but never write to, searched after the write banks. Alias `recallAdditionalBanks`, the name the Claude Code integration uses. A bank also listed in `additional_banks` stays writable. |
@@ -232,7 +232,7 @@ Some keys also accept an older name: `apiKey` for `api_key`, `budget` for `recal
 
 #### Multiple banks
 
-The primary bank is chosen in this order: a matching `bank_routes` entry, then a `.hindsight/config.toml` in a trusted repository, then `bank_id_template`, then `HINDSIGHT_BANK_ID` or `bank_id`. Writes go to the primary, then `bank_id` when `mirror_to_own_bank` is on, then each `additional_banks` entry. Recall searches the same banks and then each `recall_additional_banks` entry, all at once, each with the configured budget and `recall_max_tokens`; results are merged in that order and deduplicated by text. Reflect uses the primary bank only.
+The primary bank is chosen in this order: an exact-thread `channel_routes` entry, a whole-chat entry, a `.hindsight/config.toml` in a trusted repository, the global `bank_id_template`, then `HINDSIGHT_BANK_ID` or `bank_id`. Writes go to the primary, then the static bank when `mirror_to_own_bank` is on, then each `additional_banks` entry. Recall searches the same banks and then each `recall_additional_banks` entry, all at once, each with the configured budget and `recall_max_tokens`; results are merged in that order and deduplicated by text. Reflect uses the primary bank only.
 
 `additional_banks`, `recall_additional_banks` and `trusted_project_dirs` take a JSON list or comma-separated text; use the JSON form for a value that contains a comma.
 
@@ -246,35 +246,58 @@ bank_id = "acme-billing"
 
 The lookup stops at the repository root. Only `bank_id` is read.
 
-#### Conversation routes
+#### Channel routes
 
-To give Telegram chats or forum topics their own banks within one profile, add `bank_routes` to `$HERMES_HOME/hindsight/config.json`:
+To give DMs, groups, channels or supported threads their own banks within one profile, add `channel_routes` to `$HERMES_HOME/hindsight/config.json`. Users of the earlier fork must rename `bank_routes` to `channel_routes`; there is no alias.
 
 ```json
 {
   "bank_id": "personal",
-  "bank_routes": [
+  "bank_id_template": "hermes-{project}",
+  "channel_routes": [
     {
       "platform": "telegram",
       "chat_id": "-1001234567890",
-      "bank_id": "group-notes"
+      "bank_id_template": "project-a-{thread}",
+      "recall_additional_banks": []
     },
     {
       "platform": "telegram",
       "chat_id": "-1001234567890",
       "thread_id": "42",
       "bank_id": "home-automation",
-      "recall_additional_banks": ["personal"]
+      "recall_additional_banks": ["shared-context"]
     }
   ]
 }
 ```
 
-Replace the example chat and topic IDs with your own. Keep IDs as strings, including any minus sign. An exact topic route wins over a whole-chat route, regardless of list order. A route without `thread_id` covers the chat and any topics without an exact match. Different chats or topics can share a bank by selecting the same `bank_id`. Duplicate platform/chat/topic identities stop provider initialization rather than silently choosing a route.
+Replace the example chat and topic IDs with your own. Keep `platform`, `chat_id` and `thread_id` as separate strings, including any minus sign. There are no wildcards. An exact-thread route wins over a whole-chat route regardless of list order. A route without `thread_id` covers the chat and threads represented under that chat ID unless an exact override matches. Duplicate platform/chat/thread identities stop provider initialization.
 
-A route's `recall_additional_banks` replaces the global recall-only list. Omit it to inherit the global list, or use `[]` to clear it. Automatic recall and the recall tool use the same banks; reflection uses only the primary bank. A recall-only entry does not add a write destination. Existing `mirror_to_own_bank` and `additional_banks` still apply, so leave mirroring off and writable additional banks empty for primary-only writes.
+In this example, topic `17` selects `project-a-17`, topic `42` selects `home-automation`, and a message without a topic selects `project-a`. To share one bank across all topics, replace the whole-chat template with `"bank_id": "project-a"`. Different conversations can intentionally select the same bank.
 
-Routes resolve once at provider initialization from the chat/topic identity, not message text, topic names or session IDs. Resets and resumes keep the selected route. Recreate the affected backend agent after changing route configuration; refreshing the frontend does not reload it. No matching route means the existing bank selection remains unchanged. Routing does not migrate existing memories and is not an access-control boundary.
+Route-local and global templates support the same placeholders. `{chat}` and `{thread}` come from the provider's `chat_id` and `thread_id`; missing values are empty. Placeholder values use the existing bank-name sanitization, so a Slack thread ID such as `171.234` becomes `171-234`. Empty placeholders and leftover repeated delimiters collapse. Use a fixed `bank_id` instead of a constant template.
+
+`{project}` works in a route-local template even without a global project template. Project naming does not require `trusted_project_dirs`; trust controls reading repository configuration, not deriving the folder name. With the example global template, desktop and CLI sessions in the same repository select the same bank unless trusted repository configuration overrides it. Outside a repository it renders `hermes`, not `personal`. Static fallback applies only when a template is absent, invalid or renders empty. Equal repository folder names can collide; use explicit repository bank IDs when needed.
+
+If a selected route template is malformed or renders empty, the plugin warns and falls back to trusted repository configuration, then the global template, then the static bank. It keeps that route's recall settings and does not try a less-specific route. `project-a-{thread}` rendering `project-a` is valid, not a fallback.
+
+A route's `recall_additional_banks` replaces the global recall-only list. Omit it to inherit the global list, or use `[]` to clear it. An exact-thread route does not inherit fields from a whole-chat route. Automatic recall and the recall tool use the same banks; reflection uses only the primary bank. A recall-only entry does not add a write destination. Existing `mirror_to_own_bank` and `additional_banks` can independently make that bank writable, so leave mirroring off and writable additional banks empty for primary-only writes.
+
+Routes match conversation IDs, not message text or topic names. Destinations resolve once at provider initialization, before memory operations. Resets and resumes keep the selected destination, including a route-template fallback. Recreating the provider evaluates configuration again; a route template using `{session}` can then select a different bank. Prefer stable chat, thread or project variables for persistent memory. Global-template session-switch behavior is unchanged. Recreate the affected backend agent after changing route configuration; refreshing the frontend does not reload it.
+
+No matching route means ordinary repository/global/static selection. A selected bank's API failure never redirects retention to a fallback bank; queued writes keep their selected destination. Routing does not migrate memories and is not an access-control boundary.
+
+Platform identity mapping:
+
+| Platform | Route identity |
+|----------|----------------|
+| Telegram | Chat/group `chat_id` plus optional topic `thread_id`. |
+| WhatsApp | Group or DM `chat_id`; no thread dimension in the inspected adapter. |
+| Slack | Channel/DM `chat_id` plus optional thread ID. Multi-workspace identity remains unverified. |
+| Discord | Channel or thread ID as `chat_id`. A Discord thread has its own chat ID and needs its own route. |
+
+Discord parent-channel inheritance is not supported. The provider does not receive the adapter's parent channel ID, and the plugin makes no network calls to infer it. These mappings describe adapter identity handling, not live certification of route templates on every platform.
 
 ### Recall
 

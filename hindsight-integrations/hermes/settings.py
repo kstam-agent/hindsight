@@ -109,31 +109,34 @@ def _normalize_string_list(value: Any) -> List[str]:
 
 
 @dataclass(frozen=True)
-class _BankRoute:
+class _ChannelRoute:
     platform: str
     chat_id: str
-    bank_id: str
+    bank_id: str | None = None
+    bank_id_template: str | None = None
     thread_id: str | None = None
     recall_additional_banks: list[str] | str | None = None
 
     def __post_init__(self) -> None:
-        for name in ("platform", "chat_id", "bank_id", "thread_id"):
+        if (self.bank_id is None) == (self.bank_id_template is None):
+            raise ValueError("Channel route requires exactly one of bank_id or bank_id_template")
+        for name in ("platform", "chat_id", "bank_id", "bank_id_template", "thread_id"):
             value = getattr(self, name)
-            if name == "thread_id" and value is None:
+            if name in {"bank_id", "bank_id_template", "thread_id"} and value is None:
                 continue
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"Bank route {name} must be a non-empty string")
+                raise ValueError(f"Channel route {name} must be a non-empty string")
 
 
-def _resolve_bank_route(value: Any, *, platform: str, chat_id: str, thread_id: str) -> _BankRoute | None:
+def _resolve_channel_route(value: Any, *, platform: str, chat_id: str, thread_id: str) -> _ChannelRoute | None:
     """Select an exact topic before a whole-chat route, rejecting duplicate identities."""
     selected = None
     identities: set[tuple[str, str, str | None]] = set()
     for entry in value:
-        route = _BankRoute(**entry)
+        route = _ChannelRoute(**entry)
         identity = (route.platform, route.chat_id, route.thread_id)
         if identity in identities:
-            raise ValueError(f"Duplicate bank route for {identity!r}")
+            raise ValueError(f"Duplicate channel route for {identity!r}")
         identities.add(identity)
         if route.platform != platform or route.chat_id != chat_id:
             continue
@@ -224,7 +227,7 @@ def _sanitize_bank_segment(value: str) -> str:
 
 
 def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str) -> str:
-    """Render a bank_id template ({profile}, {workspace}, {project}, {platform}, {user}, {session}),
+    """Render a bank_id template from the supplied profile, project and conversation values,
     sanitizing each placeholder; the ``-``/``_`` runs empty placeholders leave are
     collapsed (``hermes-{user}`` -> ``hermes``). Empty/invalid template -> *fallback*."""
     if not template:

@@ -73,7 +73,7 @@ from .settings import (
     _project_name,
     _repository_root,
     _resolve_bank_id_template,
-    _resolve_bank_route,
+    _resolve_channel_route,
     _template_fields,
 )
 
@@ -677,7 +677,7 @@ class HindsightMemoryProvider(MemoryProvider):
             },
             {
                 "key": "bank_id_template",
-                "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {project}, {platform}, {user}, {session}. {project} is the git repository name (shared across worktrees, empty outside a repository). Example: hermes-{project}",
+                "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {project}, {platform}, {user}, {session}, {chat}, {thread}. {project} is the git repository name (shared across worktrees, empty outside a repository). Example: hermes-{project}",
                 "default": "",
             },
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
@@ -1174,10 +1174,11 @@ class HindsightMemoryProvider(MemoryProvider):
 
             client_version = pkg_version("hindsight-client")
         logger.info(
-            "Hindsight initialized: mode=%s, api_url=%s, bank=%s, budget=%s, memory_mode=%s, prefetch_method=%s, client=%s",
+            "Hindsight initialized: mode=%s, api_url=%s, bank=%s, bank_source=%s, budget=%s, memory_mode=%s, prefetch_method=%s, client=%s",
             self._mode,
             self._api_url,
             self._bank_id,
+            self._bank_source,
             self._budget,
             self._memory_mode,
             self._prefetch_method,
@@ -1185,7 +1186,7 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         if self._bank_id_template or self._bank_source == "repository config":
             logger.debug(
-                "Hindsight bank %s from %s (template %r: profile=%s workspace=%s project=%s platform=%s user=%s, cwd=%s)",
+                "Hindsight bank %s from %s (global template %r: profile=%s workspace=%s project=%s platform=%s user=%s, cwd=%s)",
                 self._bank_id,
                 self._bank_source,
                 self._bank_id_template,
@@ -1284,16 +1285,18 @@ class HindsightMemoryProvider(MemoryProvider):
                 ordered.append(bank)
         return ordered
 
-    def _resolve_template_bank(self) -> str:
+    def _resolve_template_bank(self, template: str | None = None, fallback: str | None = None) -> str:
         return _resolve_bank_id_template(
-            self._bank_id_template,
-            fallback=self._static_bank_id,
+            self._bank_id_template if template is None else template,
+            fallback=self._static_bank_id if fallback is None else fallback,
             profile=self._agent_identity,
             workspace=self._agent_workspace,
             project=self._project,
             platform=self._platform,
             user=self._user_id,
             session=self._session_id,
+            chat=self._chat_id,
+            thread=self._thread_id,
         )
 
     def _apply_connection_settings(self, cfg: dict) -> None:
@@ -1310,13 +1313,15 @@ class HindsightMemoryProvider(MemoryProvider):
         self._static_bank_id = (
             get_secret("HINDSIGHT_BANK_ID", "") or cfg.get("bank_id") or banks.get("bankId") or "hermes"
         )
-        route = _resolve_bank_route(
-            cfg.get("bank_routes", []), platform=self._platform, chat_id=self._chat_id, thread_id=self._thread_id
+        route = _resolve_channel_route(
+            cfg.get("channel_routes", []), platform=self._platform, chat_id=self._chat_id, thread_id=self._thread_id
         )
         # Precedence: conversation route → trusted repository → template → static bank_id.
         # The repository is only looked up when something needs it, and only once.
         trusted_dirs = _normalize_string_list(cfg.get("trusted_project_dirs"))
         uses_project = "project" in _template_fields(self._bank_id_template)
+        if route is not None and route.bank_id_template:
+            uses_project = uses_project or "project" in _template_fields(route.bank_id_template)
         root, cwd_bank, self._project = None, None, ""
         if self._cwd and (trusted_dirs or uses_project):
             try:
@@ -1330,13 +1335,29 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._project = _project_name(root)
             except Exception as exc:
                 logger.warning("hindsight: cannot name the project at %s: %r — {project} is empty", root, exc)
+        route_bank = ""
         if route is not None:
-            self._bank_id, self._bank_source = route.bank_id, "conversation route"
+            route_bank = route.bank_id or self._resolve_template_bank(route.bank_id_template, fallback="")
+        if route is not None and route_bank:
+            self._bank_id = route_bank
+            self._bank_source = "channel route template" if route.bank_id_template else "channel route bank_id"
         elif cwd_bank:
             self._bank_id, self._bank_source = cwd_bank, "repository config"
         else:
-            self._bank_id = self._resolve_template_bank()
-            self._bank_source = "template" if self._bank_id_template else "bank_id"
+            template_bank = self._resolve_template_bank(fallback="")
+            self._bank_id = template_bank or self._static_bank_id
+            self._bank_source = "template" if template_bank else "bank_id"
+            if self._bank_id_template and not template_bank:
+                self._bank_source = "template fallback to bank_id"
+        if route is not None and not route_bank:
+            logger.warning(
+                "Hindsight channel route template %r is invalid or empty; using %s bank %r",
+                route.bank_id_template,
+                self._bank_source,
+                self._bank_id,
+            )
+            # A matched route pins even its fallback bank across resets and resumes.
+            self._bank_source = f"channel route fallback to {self._bank_source}"
         # Multi-bank write/recall (optional, default off): the deduped ordered
         # set used for write fan-out and prioritized recall merge.
         self._mirror_to_own_bank = bool(cfg.get("mirror_to_own_bank", False))
@@ -2015,7 +2036,9 @@ class HindsightMemoryProvider(MemoryProvider):
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
         # A {session} bank template names a bank per session: follow the switch.
-        if self._bank_source == "template" and "session" in _template_fields(self._bank_id_template):
+        if self._bank_source in {"template", "template fallback to bank_id"} and "session" in _template_fields(
+            self._bank_id_template
+        ):
             self._bank_id = self._resolve_template_bank()
             self._write_bank_ids = self._build_write_bank_ids()
         self._session_turns = []
