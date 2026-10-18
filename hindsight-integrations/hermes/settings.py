@@ -108,6 +108,42 @@ def _normalize_string_list(value: Any) -> List[str]:
     return normalized
 
 
+@dataclass(frozen=True)
+class _BankRoute:
+    platform: str
+    chat_id: str
+    bank_id: str
+    thread_id: str | None = None
+    recall_additional_banks: list[str] | str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("platform", "chat_id", "bank_id", "thread_id"):
+            value = getattr(self, name)
+            if name == "thread_id" and value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Bank route {name} must be a non-empty string")
+
+
+def _resolve_bank_route(value: Any, *, platform: str, chat_id: str, thread_id: str) -> _BankRoute | None:
+    """Select an exact topic before a whole-chat route, rejecting duplicate identities."""
+    selected = None
+    identities: set[tuple[str, str, str | None]] = set()
+    for entry in value:
+        route = _BankRoute(**entry)
+        identity = (route.platform, route.chat_id, route.thread_id)
+        if identity in identities:
+            raise ValueError(f"Duplicate bank route for {identity!r}")
+        identities.add(identity)
+        if route.platform != platform or route.chat_id != chat_id:
+            continue
+        if route.thread_id == thread_id:
+            selected = route
+        elif route.thread_id is None and selected is None:
+            selected = route
+    return selected
+
+
 def _normalize_min_scores(value: Any) -> dict[str, float] | None:
     """Normalize ``recall_min_scores`` to ``{score_name: floor}``, or ``None`` for no floor.
 

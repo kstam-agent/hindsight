@@ -222,6 +222,7 @@ Some keys also accept an older name: `apiKey` for `api_key`, `budget` for `recal
 |-----|---------|-------------|
 | `bank_id` | `hermes` | Memory bank name (static fallback used when `bank_id_template` is unset or resolves empty) |
 | `bank_id_template` | — | Optional template to derive the bank name dynamically. Placeholders: `{profile}`, `{workspace}`, `{project}`, `{platform}`, `{user}`, `{session}`. `{project}` is the name of the git repository Hermes runs in; every worktree of a repository resolves to the same name, and it is empty outside a repository or for one rooted at your home directory. Example: `hermes-{profile}` isolates memory per active Hermes profile, `{project}` gives each repository its own bank. Empty placeholders collapse cleanly (e.g. `hermes-{user}` with no user becomes `hermes`). |
+| `bank_routes` | `[]` | Optional JSON list of chat/topic routes, matched by `platform`, `chat_id` and optional `thread_id`. Each route selects `bank_id` and can override `recall_additional_banks`. See "Conversation routes" below. |
 | `mirror_to_own_bank` | `false` | Also write to `bank_id` when the template resolves to a different bank, so a profile keeps its own memory while working in project banks. |
 | `additional_banks` | — | Extra banks to write to and recall from, in priority order. |
 | `recall_additional_banks` | — | Extra banks to recall from but never write to, searched after the write banks. Alias `recallAdditionalBanks`, the name the Claude Code integration uses. A bank also listed in `additional_banks` stays writable. |
@@ -231,9 +232,9 @@ Some keys also accept an older name: `apiKey` for `api_key`, `budget` for `recal
 
 #### Multiple banks
 
-The primary bank is chosen in this order: a `.hindsight/config.toml` in a trusted repository, then `bank_id_template`, then `HINDSIGHT_BANK_ID` or `bank_id`. Writes go to the primary, then `bank_id` when `mirror_to_own_bank` is on, then each `additional_banks` entry. Recall searches the same banks and then each `recall_additional_banks` entry, all at once, each with the configured budget and `recall_max_tokens`; results are merged in that order and deduplicated by text. Reflect uses the primary bank only.
+The primary bank is chosen in this order: a matching `bank_routes` entry, then a `.hindsight/config.toml` in a trusted repository, then `bank_id_template`, then `HINDSIGHT_BANK_ID` or `bank_id`. Writes go to the primary, then `bank_id` when `mirror_to_own_bank` is on, then each `additional_banks` entry. Recall searches the same banks and then each `recall_additional_banks` entry, all at once, each with the configured budget and `recall_max_tokens`; results are merged in that order and deduplicated by text. Reflect uses the primary bank only.
 
-The three list settings take a JSON list or comma-separated text; use the JSON form for a value that contains a comma.
+`additional_banks`, `recall_additional_banks` and `trusted_project_dirs` take a JSON list or comma-separated text; use the JSON form for a value that contains a comma.
 
 A failing extra bank is skipped for five minutes, with one warning when it goes down and one info line when it answers again; recall and writes cool down separately, and a bank misses the writes made while its writes are cooling down. An extra bank that has not answered after 80% of `timeout` counts as failing, so it never costs the primary its results. A failing primary bank fails the call exactly as it does with a single bank, and a write stops there, before any extra bank is touched.
 
@@ -244,6 +245,36 @@ bank_id = "acme-billing"
 ```
 
 The lookup stops at the repository root. Only `bank_id` is read.
+
+#### Conversation routes
+
+To give Telegram chats or forum topics their own banks within one profile, add `bank_routes` to `$HERMES_HOME/hindsight/config.json`:
+
+```json
+{
+  "bank_id": "personal",
+  "bank_routes": [
+    {
+      "platform": "telegram",
+      "chat_id": "-1001234567890",
+      "bank_id": "group-notes"
+    },
+    {
+      "platform": "telegram",
+      "chat_id": "-1001234567890",
+      "thread_id": "42",
+      "bank_id": "home-automation",
+      "recall_additional_banks": ["personal"]
+    }
+  ]
+}
+```
+
+Replace the example chat and topic IDs with your own. Keep IDs as strings, including any minus sign. An exact topic route wins over a whole-chat route, regardless of list order. A route without `thread_id` covers the chat and any topics without an exact match. Different chats or topics can share a bank by selecting the same `bank_id`. Duplicate platform/chat/topic identities stop provider initialization rather than silently choosing a route.
+
+A route's `recall_additional_banks` replaces the global recall-only list. Omit it to inherit the global list, or use `[]` to clear it. Automatic recall and the recall tool use the same banks; reflection uses only the primary bank. A recall-only entry does not add a write destination. Existing `mirror_to_own_bank` and `additional_banks` still apply, so leave mirroring off and writable additional banks empty for primary-only writes.
+
+Routes resolve once at provider initialization from the chat/topic identity, not message text, topic names or session IDs. Resets and resumes keep the selected route. Recreate the affected backend agent after changing route configuration; refreshing the frontend does not reload it. No matching route means the existing bank selection remains unchanged. Routing does not migrate existing memories and is not an access-control boundary.
 
 ### Recall
 

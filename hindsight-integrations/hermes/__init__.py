@@ -73,6 +73,7 @@ from .settings import (
     _project_name,
     _repository_root,
     _resolve_bank_id_template,
+    _resolve_bank_route,
     _template_fields,
 )
 
@@ -1309,7 +1310,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._static_bank_id = (
             get_secret("HINDSIGHT_BANK_ID", "") or cfg.get("bank_id") or banks.get("bankId") or "hermes"
         )
-        # Precedence: closest .hindsight/config.toml in a trusted repository → template → static bank_id.
+        route = _resolve_bank_route(
+            cfg.get("bank_routes", []), platform=self._platform, chat_id=self._chat_id, thread_id=self._thread_id
+        )
+        # Precedence: conversation route → trusted repository → template → static bank_id.
         # The repository is only looked up when something needs it, and only once.
         trusted_dirs = _normalize_string_list(cfg.get("trusted_project_dirs"))
         uses_project = "project" in _template_fields(self._bank_id_template)
@@ -1326,7 +1330,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._project = _project_name(root)
             except Exception as exc:
                 logger.warning("hindsight: cannot name the project at %s: %r — {project} is empty", root, exc)
-        if cwd_bank:
+        if route is not None:
+            self._bank_id, self._bank_source = route.bank_id, "conversation route"
+        elif cwd_bank:
             self._bank_id, self._bank_source = cwd_bank, "repository config"
         else:
             self._bank_id = self._resolve_template_bank()
@@ -1339,9 +1345,11 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall-only banks (optional, default off): searched after the write
         # set, never written. ``recallAdditionalBanks`` is the name the
         # claude-code and omo integrations use for the same setting.
-        self._recall_additional_bank_ids = _normalize_string_list(
-            cfg.get("recall_additional_banks") or cfg.get("recallAdditionalBanks")
-        )
+        recall_banks = cfg.get("recall_additional_banks") or cfg.get("recallAdditionalBanks")
+        # An empty route list clears inherited recall banks; omission keeps them.
+        if route is not None and route.recall_additional_banks is not None:
+            recall_banks = route.recall_additional_banks
+        self._recall_additional_bank_ids = _normalize_string_list(recall_banks)
         budget = cfg.get("recall_budget") or cfg.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
         memory_mode = cfg.get("memory_mode", "hybrid")
